@@ -1,466 +1,564 @@
-import sys
-import os
-import re
-import shutil
-from typing import List, Tuple, Optional, Dict
+#!/usr/bin/env python3
+"""
+Universal .so Patcher: Plain Text, XOR, Oxorany, Combined Scan.
+Yêu cầu: numpy, numba (tùy chọn)
+"""
+import os, sys, re, shutil, argparse
+import numpy as np
+from pathlib import Path
+from typing import List, Tuple, Dict
 
-class Colors:
-    RED = "\033[38;2;240;60;60m"
-    BLUE = "\033[38;2;50;115;220m"
-    CYAN = "\033[38;2;0;200;255m"
-    GREEN = "\033[38;2;40;230;150m"
-    YELLOW = "\033[38;2;255;200;0m"
-    PURPLE = "\033[38;2;180;100;220m"
-    RESET = "\033[0m"
-    BOLD = "\033[1m"
+# ─── Cấu hình ──────────────────────────────────────────────
+STEP = 16                # align 0x10 của oxorany
+WIN_SIZE = 2048          # cửa sổ giải mã oxorany
+DEFAULT_XOR_KEY = 0x2E
+MIN_STR_LEN = 5
 
-def cprint(text: str, color: str = Colors.RESET):
-    print(f"{color}{text}{Colors.RESET}")
+# Tập ký tự an toàn cho URL (tránh rác)
+URL_SAFE = set(b'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_~:/?#[]@!$&\'()*+,;=%')
+def is_url_safe(b): return b in URL_SAFE
 
+# ─── Tăng tốc Numba (nếu có) ──────────────────────────────
+try:
+    from numba import njit
+    USE_NUMBA = True
+    print("[*] Numba enabled – tốc độ oxorany tối đa.")
+except ImportError:
+    USE_NUMBA = False
+    print("[*] Numba không có, dùng pure Python (vẫn nhanh).")
+
+if USE_NUMBA:
+    @njit
+    def is_url_safe_numba(b):
+        if 0x61 <= b <= 0x7A: return True
+        if 0x41 <= b <= 0x5A: return True
+        if 0x30 <= b <= 0x39: return True
+        if b in (0x2D,0x2E,0x5F,0x7E,0x3A,0x2F,0x3F,0x23,0x5B,0x5D,0x40,0x21,0x24,0x26,0x27,0x28,0x29,0x2A,0x2B,0x2C,0x3B,0x3D,0x25):
+            return True
+        return False
+
+    @njit
+    def decrypt_byte_numba(enc, idx, key):
+        return ((enc ^ ((idx + key) & 0xFF)) - (key * 7)) & 0xFF
+
+    @njit
+    def scan_window_numba(enc_data, key, pattern, pat_len):
+        n = len(enc_data)
+        K7 = (key * 7) & 0xFF
+        dec = np.empty(n, dtype=np.uint8)
+        for i in range(n):
+            dec[i] = ((enc_data[i] ^ ((i + key) & 0xFF)) - K7) & 0xFF
+        for i in range(n - pat_len + 1):
+            match = True
+            for j in range(pat_len):
+                if dec[i+j] != pattern[j]:
+                    match = False
+                    break
+            if match:
+                start = i
+                while start > 0 and is_url_safe_numba(dec[start-1]):
+                    start -= 1
+                end = i + pat_len
+                while end < n and dec[end] != 0 and is_url_safe_numba(dec[end]):
+                    end += 1
+                return start, end
+        return -1, -1
+else:
+    def scan_window_numpy(enc_data, key, pattern, pat_len):
+        n = len(enc_data)
+        K7 = (key * 7) & 0xFF
+        idx = np.arange(n, dtype=np.uint64)
+        dec = ((enc_data ^ ((idx + key) & 0xFF)) - K7) & 0xFF
+        match = np.ones(n - pat_len + 1, dtype=bool)
+        for j in range(pat_len):
+            match &= (dec[j:j+n-pat_len+1] == pattern[j])
+        found = np.where(match)[0]
+        if found.size > 0:
+            i = found[0]
+            start = i
+            while start > 0 and is_url_safe(dec[start-1]):
+                start -= 1
+            end = i + pat_len
+            while end < n and dec[end] != 0 and is_url_safe(dec[end]):
+                end += 1
+            return start, end
+        return -1, -1
+
+    def decrypt_byte_numba(enc, idx, key):
+        return ((enc ^ ((idx + key) & 0xFF)) - (key * 7)) & 0xFF
+
+# ─── Hàm tiện ích ─────────────────────────────────────────
 def clear_screen():
     os.system('cls' if os.name == 'nt' else 'clear')
 
-def hr(char="─", width=60, color=Colors.BLUE):
-    cprint(char * width, color)
-
-DEFAULT_KEY = 0x2E
-
-def xor_crypt(data: bytes, key: int) -> bytes:
-    return bytes([b ^ (key & 0xFF) for b in data])
-
-def find_urls_in_data(data: bytes, include_base_only: bool = False) -> List[Tuple[int, str]]:
-    """
-    Tìm URL trong dữ liệu.
-    include_base_only: Nếu True, cũng tìm base URL không có path (dành cho panel link riêng)
-    """
-    matches = []
-    
-    url_pattern = re.compile(rb"https?://[A-Za-z0-9\._\-?=%%&:/#]+")
-    for m in url_pattern.finditer(data):
-        try:
-            url_str = m.group().decode('utf-8', errors='ignore')
-            if '.' in url_str and len(url_str) > 10:
-                matches.append((m.start(), url_str))
-        except:
-            continue
-    
-    if include_base_only:
-        base_pattern = re.compile(rb"https?://[A-Za-z0-9\._\-:]+(?=[^A-Za-z0-9\._\-:/]|$)")
-        for m in base_pattern.finditer(data):
-            try:
-                url_str = m.group().decode('utf-8', errors='ignore')
-                if '.' in url_str and len(url_str) >= 10:
-                    if not any(offset == m.start() for offset, _ in matches):
-                        matches.append((m.start(), url_str))
-            except:
-                continue
-    
-
-    domain_pattern = re.compile(rb"[a-zA-Z0-9][-a-zA-Z0-9]*\.[a-zA-Z0-9][-a-zA-Z0-9.]*\.(com|net|org|io|xyz|me|co|id|app|dev|gg|cc|top|site)|fun|online|tech|store|blog|info|biz|us|uk|cn|ru|jp|fr|de|eu|tv|ws|club|vip|pro|art|design|click")
-    for m in domain_pattern.finditer(data):
-        try:
-            domain_str = m.group().decode('utf-8', errors='ignore')
-            if len(domain_str) >= 8 and domain_str.count('.') >= 1:
-                if not any(offset == m.start() for offset, _ in matches):
-                    matches.append((m.start(), domain_str))
-        except:
-            continue
-    
-    matches.sort(key=lambda x: x[0])
-    return matches
-
-def patch_by_offset(data: bytearray, offset: int, old_bytes: bytes, new_bytes: bytes) -> bool:
-    end = offset + len(old_bytes)
-    if offset < 0 or end > len(data):
-        return False
-    if bytes(data[offset:end]) != old_bytes:
-        return False
-    data[offset:offset + len(new_bytes)] = new_bytes
-    if len(new_bytes) < len(old_bytes):
-        pad_len = len(old_bytes) - len(new_bytes)
-        data[offset + len(new_bytes):end] = b"\x00" * pad_len
-    return True
-
-def oxorany_decrypt_byte(enc_byte: int, i: int, key: int) -> int:
-    temp = enc_byte ^ ((i + key) & 0xFF)
-    return (temp - (key * 7)) & 0xFF
-
-def oxorany_decrypt_string(enc_bytes: bytes, key: int) -> str:
-    decrypted = []
-    for i, b in enumerate(enc_bytes):
-        dec = oxorany_decrypt_byte(b, i, key)
-        if dec == 0:
-            break
-        decrypted.append(dec)
-    try:
-        return bytes(decrypted).decode('utf-8', errors='ignore')
-    except:
-        return ""
-
-def oxorany_encrypt_string(plain_str: str, key: int) -> bytes:
-    plain_bytes = plain_str.encode('utf-8') + b'\x00'
-    return bytes(
-        ((b + (key * 7)) ^ (i + key)) & 0xFF
-        for i, b in enumerate(plain_bytes)
-    )
-
-def find_oxorany_url_candidates(data: bytes, min_len: int = 20, max_len: int = 200) -> List[Tuple[int, bytes]]:
-    candidates = []
-    i = 0
-    n = len(data)
-    while i < n - min_len:
-        if data[i] == 0:
-            i += 1
-            continue
-        start = i
-        length = 0
-        while i < n and data[i] != 0 and length < max_len:
-            i += 1
-            length += 1
-        if i < n and data[i] == 0 and min_len <= length <= max_len:
-            raw = data[start:start + length + 1]
-            if raw.count(b'\x00') == 1:
-                candidates.append((start, raw))
-            i += 1
-        else:
-            i += 1
-    return candidates
-
-def recover_key_from_https_candidate(enc_bytes: bytes, max_key_search: int = 65536) -> Optional[Tuple[int, str]]:
-    if len(enc_bytes) < 8:
-        return None
-    https_bytes = b"https://"
-    for key in range(max_key_search):
-        match = True
-        for i in range(8):
-            dec = oxorany_decrypt_byte(enc_bytes[i], i, key)
-            if dec != https_bytes[i]:
-                match = False
-                break
-        if match:
-            full_str = oxorany_decrypt_string(enc_bytes, key)
-            if full_str.startswith("https://") and '.' in full_str and len(full_str) >= 15:
-                return key, full_str
-    return None
-
-def backup_file(path: str) -> str:
+def backup_file(path):
     bak = path + ".bak"
     shutil.copy2(path, bak)
     return bak
 
-def brute_force_key(file_path: str) -> int:
-    cprint("\n🔍 Bắt đầu brute-force XOR key (0–255)...", Colors.CYAN)
-    cprint("    Tìm kiếm URL đầy đủ và base URL (cho panel link)...", Colors.CYAN)
-    try:
-        with open(file_path, "rb") as f:
-            encrypted = f.read()
-    except Exception as e:
-        cprint(f"❌ Không thể đọc file: {e}", Colors.RED)
-        return -1
+# ─── Class chính ──────────────────────────────────────────
+class UniversalPatcher:
+    def __init__(self):
+        self.file = None           # đường dẫn file hiện tại
+        self.xor_key = DEFAULT_XOR_KEY
+        self.oxorany_results = []  # (key, offset, string)
 
-    valid_keys = []
-    for key in range(256):
-        try:
-            decrypted = xor_crypt(encrypted, key)
-            urls = find_urls_in_data(decrypted, include_base_only=True)
-            if urls:
-                cprint(f"✅ Tìm thấy key: 0x{key:02X} ({key}) → {len(urls)} URL", Colors.GREEN)
-                for i, (_, url) in enumerate(urls[:3], 1):
-                    cprint(f"   Ví dụ: {url}", Colors.BLUE)
-                valid_keys.append(key)
-        except:
-            continue
+    # ── Load file ──────────────────────────────────────
+    def load_file(self, path):
+        if not os.path.isfile(path):
+            print("❌ File không tồn tại.")
+            return False
+        self.file = path
+        print(f"✅ Đã chọn: {path}")
+        return True
 
-    if not valid_keys:
-        cprint("❌ Không tìm thấy key hợp lệ nào.", Colors.RED)
-        return -1
-    elif len(valid_keys) == 1:
-        cprint(f"\n🎯 Sử dụng key: 0x{valid_keys[0]:02X}", Colors.GREEN)
-        return valid_keys[0]
-    else:
-        cprint(f"\n⚠️  Tìm thấy {len(valid_keys)} key hợp lệ:", Colors.YELLOW)
-        for i, k in enumerate(valid_keys, 1):
-            cprint(f"{i}. 0x{k:02X} ({k})", Colors.BLUE)
+    # ── Chế độ 1: Không mã hóa (plain text) ─────────────
+    def plain_search(self, term):
+        """Tìm kiếm trực tiếp trong file nhị phân."""
+        if not self.file: return []
+        with open(self.file, 'rb') as f:
+            data = f.read()
+        results = []
+        pos = 0
         while True:
+            idx = data.find(term.encode(), pos)
+            if idx == -1: break
+            # Lấy context xung quanh
+            ctx_start = max(0, idx - 20)
+            ctx_end = min(len(data), idx + len(term) + 20)
             try:
-                choice = input(f"\n{Colors.BOLD}Chọn số thứ tự key: {Colors.RESET}").strip()
-                idx = int(choice) - 1
-                if 0 <= idx < len(valid_keys):
-                    return valid_keys[idx]
-                else:
-                    cprint("❌ Lựa chọn không hợp lệ!", Colors.RED)
-            except ValueError:
-                cprint("❌ Hãy nhập số!", Colors.RED)
+                ctx = data[ctx_start:ctx_end].decode('ascii', errors='replace')
+            except:
+                ctx = repr(data[ctx_start:ctx_end])
+            results.append((idx, ctx))
+            pos = idx + 1
+        return results
 
-def list_urls_xor(file_path: str, key: int):
-    try:
-        with open(file_path, "rb") as f:
-            encrypted = f.read()
-        decrypted = xor_crypt(encrypted, key)
-        
-        urls = find_urls_in_data(decrypted, include_base_only=True)
-        
-        if not urls:
-            cprint("❌ Không tìm thấy URL nào (chế độ XOR).", Colors.RED)
-            return
-        
-        cprint(f"\n🔗 Tìm thấy {len(urls)} URL (XOR key 0x{key:02X}):", Colors.GREEN)
-        for i, (pos, url) in enumerate(urls, 1):
-            cprint(f"{i}. {url}", Colors.BLUE)
-            cprint(f"   Offset: {hex(pos)}", Colors.CYAN)
-        input("\nNhấn Enter để tiếp tục...")
-    except Exception as e:
-        cprint(f"❌ Lỗi: {e}", Colors.RED)
-
-def replace_urls_xor(file_path: str, key: int):
-    try:
-        with open(file_path, "rb") as f:
-            encrypted = f.read()
-        decrypted = xor_crypt(encrypted, key)
-        
-        urls = find_urls_in_data(decrypted, include_base_only=True)
-        
-        if not urls:
-            cprint("❌ Không có URL nào để thay thế (chế độ XOR).", Colors.RED)
-            return
-        
-        cprint(f"\n🔗 Tìm thấy {len(urls)} URL:", Colors.GREEN)
-        for i, (pos, url) in enumerate(urls, 1):
-            cprint(f"{i}. {url}", Colors.BLUE)
-            cprint(f"   Offset: {hex(pos)}", Colors.CYAN)
-        choice = input(f"\n{Colors.BOLD}Chọn số thứ tự URL (ví dụ: 1 hoặc 1,3): {Colors.RESET}").strip()
-        try:
-            selected = [int(x.strip()) - 1 for x in choice.split(",") if x.strip()]
-        except:
-            cprint("❌ Lựa chọn không hợp lệ!", Colors.RED)
-            return
-        confirm = input(f"{Colors.BOLD}Chắc chắn thay thế URL này? (y/N): {Colors.RESET}").strip().lower()
-        if confirm != 'y':
-            cprint("🚫 Đã hủy.", Colors.YELLOW)
-            return
-        bak_file = backup_file(file_path)
-        cprint(f"✅ Backup: {bak_file}", Colors.BLUE)
-        patched = bytearray(decrypted)
-        replacements = 0
-        for idx in selected:
-            if idx < 0 or idx >= len(urls):
-                cprint(f"❌ Chỉ số không hợp lệ: {idx+1}", Colors.RED)
-                continue
-            offset, old_url = urls[idx]
-            old_bytes = old_url.encode()
-            new_url = input(f"\n{Colors.BOLD}URL mới cho '{old_url}': {Colors.RESET}").strip()
-            if not new_url:
-                cprint("⏩ Bỏ qua.", Colors.YELLOW)
-                continue
-            new_bytes = new_url.encode()
-            if len(new_bytes) > len(old_bytes):
-                cprint("⏩ URL mới quá dài! Bỏ qua.", Colors.YELLOW)
-                continue
-            if patch_by_offset(patched, offset, old_bytes, new_bytes):
-                cprint(f"✅ Thành công: '{old_url}' → '{new_url}'", Colors.GREEN)
-                replacements += 1
-            else:
-                cprint(f"❌ Patch thất bại tại offset {hex(offset)}", Colors.RED)
-        if replacements == 0:
-            cprint("🚫 Không có thay đổi nào.", Colors.YELLOW)
-            return
-        encrypted_out = xor_crypt(bytes(patched), key)
-        out_file = file_path.replace(".so", "_MelzCrack.so") if file_path.endswith('.so') else file_path + "_patched"
-        with open(out_file, "wb") as f:
-            f.write(encrypted_out)
-        try:
-            shutil.copystat(file_path, out_file)
-        except:
-            pass
-        cprint(f"\n💾 File mới: {out_file}", Colors.GREEN)
-        cprint(f"✅ Đã thay thế {replacements} URL (chế độ XOR)", Colors.GREEN)
-    except Exception as e:
-        cprint(f"❌ Lỗi: {e}", Colors.RED)
-
-def replace_oxorany_urls(file_path: str):
-    try:
-        with open(file_path, "rb") as f:
+    def plain_replace(self, offset, old_str, new_str):
+        """Thay thế trực tiếp tại offset."""
+        if not self.file: return False
+        if len(new_str) > len(old_str):
+            print("⚠️ Chuỗi mới dài hơn chuỗi cũ, không thể thay.")
+            return False
+        with open(self.file, 'rb') as f:
             data = bytearray(f.read())
-    except Exception as e:
-        cprint(f"❌ Không thể đọc file: {e}", Colors.RED)
-        return
-
-    cprint("\n🔍 Đang tìm URL đã mã hóa oxorany...", Colors.CYAN)
-    candidates = find_oxorany_url_candidates(data)
-    valid_urls: List[Dict] = []
-
-    for offset, raw in candidates:
-        result = recover_key_from_https_candidate(raw)
-        if result:
-            key, url = result
-            valid_urls.append({
-                'offset': offset,
-                'original_enc': raw,
-                'url': url,
-                'key': key,
-                'length': len(raw)
-            })
-            cprint(f"✅ {url[:60]}{'...' if len(url) > 60 else ''} @ {hex(offset)}", Colors.GREEN)
-
-    if not valid_urls:
-        cprint("\n❌ Không tìm thấy URL oxorany nào.", Colors.RED)
-        input("\nNhấn Enter để quay lại...")
-        return
-
-    try:
-        choice = input(f"\n{Colors.BOLD}Chọn số thứ tự URL (1-{len(valid_urls)}): {Colors.RESET}").strip()
-        idx = int(choice) - 1
-        if not (0 <= idx < len(valid_urls)):
-            raise ValueError
-        entry = valid_urls[idx]
-    except (ValueError, KeyboardInterrupt):
-        cprint("❌ Lựa chọn không hợp lệ.", Colors.RED)
-        input("\nNhấn Enter để quay lại...")
-        return
-
-    new_url = input(f"\n{Colors.BOLD}URL mới cho:\n  {entry['url']}\n→ {Colors.RESET}").strip()
-    if not new_url:
-        cprint("🚫 Đã hủy.", Colors.YELLOW)
-        input("\nNhấn Enter để quay lại...")
-        return
-
-    try:
-        new_enc = oxorany_encrypt_string(new_url, entry['key'])
-    except Exception as e:
-        cprint(f"❌ Lỗi mã hóa: {e}", Colors.RED)
-        input("\nNhấn Enter để quay lại...")
-        return
-
-    if len(new_enc) > len(entry['original_enc']):
-        cprint(f"❌ URL mới quá dài! Tối đa: {len(entry['original_enc']) - 1} ký tự.", Colors.RED)
-        input("\nNhấn Enter để quay lại...")
-        return
-
-    try:
-        bak = backup_file(file_path)
-        cprint(f"✅ Backup: {bak}", Colors.BLUE)
-        
-        data[entry['offset']:entry['offset'] + len(new_enc)] = new_enc
-        if len(new_enc) < len(entry['original_enc']):
-            pad_start = entry['offset'] + len(new_enc)
-            pad_end = entry['offset'] + len(entry['original_enc'])
-            data[pad_start:pad_end] = b'\x00' * (pad_end - pad_start)
-
-        out_name = file_path.replace(".so", "_MelzCrack.so") if file_path.endswith('.so') else file_path + "_patched"
-        with open(out_name, "wb") as f:
+        old_bytes = old_str.encode()
+        new_bytes = new_str.encode()
+        if offset + len(old_bytes) > len(data):
+            print("❌ Offset vượt quá kích thước file.")
+            return False
+        if data[offset:offset+len(old_bytes)] != old_bytes:
+            print("⚠️ Dữ liệu tại offset không khớp. Tiếp tục? (y/n)")
+            if input().lower() != 'y':
+                return False
+        data[offset:offset+len(new_bytes)] = new_bytes
+        if len(new_bytes) < len(old_bytes):
+            data[offset+len(new_bytes):offset+len(old_bytes)] = b'\x00' * (len(old_bytes)-len(new_bytes))
+        out = self._get_output_path()
+        with open(out, 'wb') as f:
             f.write(data)
-        try:
-            shutil.copystat(file_path, out_name)
-        except:
-            pass
+        try: shutil.copystat(self.file, out)
+        except: pass
+        print(f"✅ Đã thay thế thành công → {out}")
+        return True
 
-        cprint(f"\n🎉 THÀNH CÔNG! (chế độ oxorany)", Colors.GREEN)
-        cprint(f"📁 File đầu ra: {out_name}", Colors.CYAN)
-        cprint(f"🔗 URL cũ: {entry['url']}", Colors.YELLOW)
-        cprint(f"🔗 URL mới: {new_url}", Colors.GREEN)
+    # ── Chế độ 2: XOR Key ──────────────────────────────
+    def xor_crypt(self, data, key):
+        return bytes([b ^ (key & 0xFF) for b in data])
 
-    except Exception as e:
-        cprint(f"❌ Lỗi khi patch: {e}", Colors.RED)
+    def xor_find_urls(self, data):
+        pat = re.compile(rb"https?://[A-Za-z0-9\./_\-\?\=&%:#]+")
+        return [(m.start(), m.group().decode(errors="ignore")) for m in pat.finditer(data)]
 
-    input("\nNhấn Enter để quay lại...")
+    def xor_bruteforce(self, start=0, end=255, aggressive=False):
+        if not self.file: return {}
+        with open(self.file, 'rb') as f: data = f.read()
+        results = {}
+        for k in range(start, end+1):
+            dec = self.xor_crypt(data, k)
+            if aggressive:
+                urls = self._xor_find_aggressive(dec)
+            else:
+                urls = self.xor_find_urls(dec)
+            if urls:
+                results[k] = urls[:10]
+        return results
 
-def display_menu():
-    clear_screen()
-    hr("═", 55, Colors.RED)
-    cprint("   🔧 MELZMOD URL TOOL (XOR + OXORANY) 🔧", Colors.RED + Colors.BOLD)
-    hr("═", 55, Colors.RED)
-    cprint("1. Chọn file nhị phân (.so)", Colors.BLUE)
-    cprint("2. Đặt key XOR thủ công", Colors.BLUE)
-    cprint("3. Xem danh sách URL (chế độ XOR)", Colors.BLUE)
-    cprint("4. Thay thế URL (chế độ XOR)", Colors.BLUE)
-    cprint("B. Brute-Force tự động key (XOR)", Colors.BLUE)
-    cprint("5. Thay thế URL (chế độ oxorany)", Colors.BLUE)
-    cprint("6. Thoát", Colors.BLUE)
-    hr("─", 55, Colors.BLUE)
+    def _xor_find_aggressive(self, data):
+        patterns = [
+            rb"https?://[A-Za-z0-9\./_\-\?\=&%:#]+",
+            rb"www\.[A-Za-z0-9\./_\-\?\=&%:#]+",
+            rb"[A-Za-z0-9\-]+\.(com|net|org|io|vn|edu|gov)[A-Za-z0-9\./_\-\?\=&%:#]*"
+        ]
+        urls, seen = [], set()
+        for pat in patterns:
+            for m in re.finditer(pat, data):
+                try:
+                    u = m.group().decode(errors='ignore')
+                    if u not in seen:
+                        urls.append((m.start(), u))
+                        seen.add(u)
+                except: continue
+        return urls
 
-def main():
-    current_file = ""
-    current_key = DEFAULT_KEY
+    def xor_list_urls(self):
+        if not self.file: return []
+        with open(self.file, 'rb') as f: data = f.read()
+        dec = self.xor_crypt(data, self.xor_key)
+        return self.xor_find_urls(dec)
 
+    def xor_replace_url(self, old_url, new_url):
+        if not self.file: return False
+        with open(self.file, 'rb') as f: data = f.read()
+        dec = self.xor_crypt(data, self.xor_key)
+        urls = self.xor_find_urls(dec)
+        target = None
+        for off, u in urls:
+            if u == old_url:
+                target = (off, u)
+                break
+        if not target:
+            print("❌ Không tìm thấy URL cũ.")
+            return False
+        off, u = target
+        oldb = u.encode()
+        newb = new_url.encode()
+        if len(newb) > len(oldb):
+            print("⚠️ URL mới dài hơn, không thể thay.")
+            return False
+        patched = bytearray(dec)
+        patched[off:off+len(newb)] = newb
+        if len(newb) < len(oldb):
+            patched[off+len(newb):off+len(oldb)] = b'\x00' * (len(oldb)-len(newb))
+        enc_out = self.xor_crypt(bytes(patched), self.xor_key)
+        out = self._get_output_path()
+        with open(out, 'wb') as f: f.write(enc_out)
+        try: shutil.copystat(self.file, out)
+        except: pass
+        print(f"✅ Đã thay thế và lưu vào {out}")
+        return True
+
+    # ── Chế độ 3: Oxorany ──────────────────────────────
+    def oxorany_scan(self, search_str="http"):
+        if not self.file: return []
+        data = np.fromfile(self.file, dtype=np.uint8)
+        pattern = np.array([ord(c) for c in search_str.lower()], dtype=np.uint8)
+        pat_len = len(pattern)
+        results = []
+        seen = set()
+        scan_func = scan_window_numba if USE_NUMBA else scan_window_numpy
+        for key in range(256):
+            for base in range(0, len(data) - WIN_SIZE, STEP):
+                win = data[base:base+WIN_SIZE]
+                s, e = scan_func(win, key, pattern, pat_len)
+                if s != -1 and e - s >= MIN_STR_LEN:
+                    abs_off = base + s
+                    if (key, abs_off) not in seen:
+                        seen.add((key, abs_off))
+                        dec_chunk = bytes(decrypt_byte_numba(win[i], i, key) for i in range(s, e))
+                        try:
+                            dstr = dec_chunk.decode('ascii')
+                        except:
+                            continue
+                        if (dstr.startswith('http') or dstr.startswith('www')) and '://' in dstr:
+                            results.append((key, abs_off, dstr))
+        # Lọc ưu tiên offset chia hết cho 16
+        uniq = {}
+        for k, off, s in results:
+            if off % 16 == 0:
+                uniq[(k, s)] = (off, s)
+            else:
+                if (k, s) not in uniq:
+                    uniq[(k, s)] = (off, s)
+        final = [(k, off, s) for (k, s), (off, _) in uniq.items()]
+        self.oxorany_results = final
+        return final
+
+    def oxorany_replace(self, index, new_str):
+        if not self.oxorany_results or index < 0 or index >= len(self.oxorany_results):
+            print("❌ Chỉ số không hợp lệ.")
+            return False
+        key, abs_off, old_str = self.oxorany_results[index]
+        if len(new_str.encode()) > len(old_str.encode()):
+            print("⚠️ Chuỗi mới dài hơn, không thể thay.")
+            return False
+        buf_start = abs_off - (abs_off % STEP)
+        with open(self.file, 'rb') as f:
+            f.seek(buf_start)
+            enc_win = f.read(WIN_SIZE)
+        if len(enc_win) < WIN_SIZE:
+            print("❌ Không đọc đủ dữ liệu.")
+            return False
+        win_arr = np.frombuffer(enc_win, dtype=np.uint8)
+        dec = bytes(decrypt_byte_numba(win_arr[i], i, key) for i in range(WIN_SIZE))
+        old_bytes = old_str.encode()
+        pos = dec.find(old_bytes)
+        if pos == -1:
+            print("❌ Không tìm thấy chuỗi cũ trong buffer.")
+            return False
+        dec_arr = bytearray(dec)
+        new_bytes = new_str.encode()
+        dec_arr[pos:pos+len(new_bytes)] = new_bytes
+        if len(new_bytes) < len(old_bytes):
+            dec_arr[pos+len(new_bytes):pos+len(old_bytes)] = b'\x00' * (len(old_bytes)-len(new_bytes))
+        new_enc = bytes(decrypt_byte_numba(dec_arr[i], i, key) for i in range(WIN_SIZE))
+        bak = backup_file(self.file)
+        print(f"ℹ️ Backup: {bak}")
+        with open(self.file, 'r+b') as f:
+            f.seek(buf_start)
+            f.write(new_enc)
+        print(f"✅ Đã thay thế thành công.")
+        self.oxorany_results[index] = (key, abs_off, new_str)
+        return True
+
+    def oxorany_save_results(self):
+        if not self.oxorany_results:
+            print("❌ Chưa có kết quả quét.")
+            return
+        out = self.file + "_oxorany_urls.txt"
+        with open(out, 'w') as f:
+            for k, off, s in self.oxorany_results:
+                f.write(f"key=0x{k:02X} offset=0x{off:X} -> {s}\n")
+        print(f"📄 Đã lưu: {out}")
+
+    # ── Chế độ 4: Scan tổng hợp ───────────────────────
+    def combined_scan(self, search_str="http"):
+        print("⚡ Đang quét tổng hợp (XOR + Oxorany)...")
+        # XOR brute-force toàn bộ
+        xor_res = self.xor_bruteforce(0, 255, aggressive=False)
+        print(f"✅ XOR: tìm thấy {sum(len(v) for v in xor_res.values())} URL(s) với {len(xor_res)} key.")
+        for k, urls in sorted(xor_res.items()):
+            for off, u in urls:
+                print(f"  [XOR] key=0x{k:02X} offset=0x{off:X} -> {u}")
+        # Oxorany scan
+        oxo_res = self.oxorany_scan(search_str)
+        print(f"✅ Oxorany: tìm thấy {len(oxo_res)} URL(s) sạch.")
+        for k, off, s in oxo_res:
+            print(f"  [OXORANY] key=0x{k:02X} offset=0x{off:X} -> {s}")
+        # Lưu kết quả gộp
+        out = self.file + "_combined_urls.txt"
+        with open(out, 'w') as f:
+            f.write("=== XOR URLs ===\n")
+            for k, urls in sorted(xor_res.items()):
+                for off, u in urls:
+                    f.write(f"key=0x{k:02X} offset=0x{off:X} -> {u}\n")
+            f.write("\n=== Oxorany URLs ===\n")
+            for k, off, s in oxo_res:
+                f.write(f"key=0x{k:02X} offset=0x{off:X} -> {s}\n")
+        print(f"📄 Kết quả tổng hợp đã lưu: {out}")
+
+    # ── Tiện ích nội bộ ────────────────────────────────
+    def _get_output_path(self):
+        dirn = os.path.dirname(self.file)
+        base = os.path.basename(self.file)
+        name, ext = os.path.splitext(base)
+        i = 1
+        while True:
+            p = os.path.join(dirn, f"{name}_patched_{i}{ext}")
+            if not os.path.exists(p):
+                return p
+            i += 1
+
+# ─── Menu từng chế độ ─────────────────────────────────────
+def mode_plain(patcher):
     while True:
-        display_menu()
-        choice = input(f"{Colors.BOLD}Chọn (1-6 hoặc B): {Colors.RESET}").strip().upper()
-
+        clear_screen()
+        print("=" * 50)
+        print("     CHẾ ĐỘ 1: KHÔNG MÃ HÓA (PLAIN TEXT)")
+        print("=" * 50)
+        print("1. Tìm kiếm chuỗi")
+        print("2. Thay thế chuỗi (theo offset)")
+        print("0. Quay lại menu chính")
+        choice = input("Chọn: ").strip()
         if choice == '1':
-            clear_screen()
-            filename = input(f"{Colors.BOLD}Nhập đường dẫn file: {Colors.RESET}").strip()
-            if not os.path.isfile(filename):
-                cprint("❌ Không tìm thấy file!", Colors.RED)
-                input("\nNhấn Enter...")
-                continue
-            current_file = filename
-            cprint(f"✅ Đã chọn file: {filename}", Colors.GREEN)
-            input("\nNhấn Enter...")
-
-        elif choice == '2':
-            clear_screen()
-            try:
-                key_input = input(f"{Colors.BOLD}Nhập key XOR (hex: 0x2E, decimal: 46): {Colors.RESET}").strip()
-                if key_input.startswith('0x'):
-                    key = int(key_input, 16)
+            term = input("Nhập chuỗi cần tìm: ").strip()
+            if term:
+                res = patcher.plain_search(term)
+                if res:
+                    for idx, ctx in res:
+                        print(f"  Offset 0x{idx:X}: ...{ctx}...")
                 else:
-                    key = int(key_input)
-                current_key = key & 0xFF
-                cprint(f"✅ Key mới: 0x{current_key:02X} ({current_key})", Colors.GREEN)
+                    print("Không tìm thấy.")
+            input("\nEnter để tiếp tục...")
+        elif choice == '2':
+            try:
+                off = int(input("Offset (hex): ").strip(), 16)
+                old = input("Chuỗi cũ (để xác nhận): ").strip()
+                new = input("Chuỗi mới: ").strip()
+                if old and new:
+                    patcher.plain_replace(off, old, new)
             except ValueError:
-                cprint("❌ Key không hợp lệ!", Colors.RED)
-            input("\nNhấn Enter...")
-
-        elif choice == '3':
-            clear_screen()
-            if not current_file:
-                cprint("❌ Chưa chọn file!", Colors.RED)
-            else:
-                list_urls_xor(current_file, current_key)
-            input("\nNhấn Enter...")
-
-        elif choice == '4':
-            clear_screen()
-            if not current_file:
-                cprint("❌ Chưa chọn file!", Colors.RED)
-            else:
-                replace_urls_xor(current_file, current_key)
-            input("\nNhấn Enter...")
-
-        elif choice == 'B':
-            clear_screen()
-            if not current_file:
-                cprint("❌ Hãy chọn file trước (menu 1)!", Colors.RED)
-            else:
-                key = brute_force_key(current_file)
-                if key != -1:
-                    current_key = key
-                    cprint(f"\n🔑 Key đã được đặt thành: 0x{current_key:02X}", Colors.GREEN)
-            input("\nNhấn Enter...")
-
-        elif choice == '5':
-            clear_screen()
-            if not current_file:
-                cprint("❌ Chưa chọn file!", Colors.RED)
-            else:
-                replace_oxorany_urls(current_file)
-            input("\nNhấn Enter...")
-
-        elif choice == '6':
-            cprint("\n👋 Cảm ơn bạn! Công cụ bởi Melzmod.", Colors.CYAN)
+                print("❌ Offset không hợp lệ.")
+            input("\nEnter để tiếp tục...")
+        elif choice == '0':
             break
 
+def mode_xor(patcher):
+    while True:
+        clear_screen()
+        print("=" * 50)
+        print(f"     CHẾ ĐỘ 2: XOR KEY (key hiện tại: 0x{patcher.xor_key:02X})")
+        print("=" * 50)
+        print("1. Đặt key XOR")
+        print("2. Liệt kê URL với key hiện tại")
+        print("3. Brute-force tìm key XOR")
+        print("4. Thay thế URL (theo key hiện tại)")
+        print("0. Quay lại")
+        choice = input("Chọn: ").strip()
+        if choice == '1':
+            try:
+                k = input("Nhập key (hex hoặc decimal): ").strip()
+                if k.startswith('0x'): patcher.xor_key = int(k,16) & 0xFF
+                else: patcher.xor_key = int(k) & 0xFF
+                print(f"✅ Key hiện tại: 0x{patcher.xor_key:02X}")
+            except ValueError:
+                print("❌ Key không hợp lệ.")
+            input("\nEnter...")
+        elif choice == '2':
+            urls = patcher.xor_list_urls()
+            if urls:
+                for off, u in urls:
+                    print(f"  Offset 0x{off:X}: {u}")
+            else:
+                print("❌ Không có URL nào.")
+            input("\nEnter...")
+        elif choice == '3':
+            try:
+                s = input("Key bắt đầu (mặc định 0x00): ").strip()
+                start = int(s,16) if s.startswith('0x') else (int(s) if s else 0)
+                e = input("Key kết thúc (mặc định 0xFF): ").strip()
+                end = int(e,16) if e.startswith('0x') else (int(e) if e else 255)
+            except:
+                start, end = 0, 255
+            agg = input("Chế độ nâng cao (tìm cả domain)? (y/N): ").lower() == 'y'
+            res = patcher.xor_bruteforce(start, end, agg)
+            if res:
+                for k, urls in sorted(res.items()):
+                    print(f"\n🔑 Key 0x{k:02X}:")
+                    for off, u in urls[:5]:
+                        print(f"  Offset 0x{off:X}: {u}")
+            else:
+                print("❌ Không tìm thấy URL nào.")
+            # Hỏi chọn key
+            use = input("\nDùng key nào? (Enter bỏ qua): ").strip()
+            if use:
+                try:
+                    if use.startswith('0x'): patcher.xor_key = int(use,16) & 0xFF
+                    else: patcher.xor_key = int(use) & 0xFF
+                    print(f"✅ Đã đặt key: 0x{patcher.xor_key:02X}")
+                except: pass
+            input("\nEnter...")
+        elif choice == '4':
+            old = input("URL cũ: ").strip()
+            new = input("URL mới: ").strip()
+            if old and new:
+                patcher.xor_replace_url(old, new)
+            input("\nEnter...")
+        elif choice == '0':
+            break
+
+def mode_oxorany(patcher):
+    while True:
+        clear_screen()
+        print("=" * 50)
+        print("     CHẾ ĐỘ 3: OXORANY")
+        print("=" * 50)
+        print("1. Quét tìm URL (oxorany)")
+        print("2. Hiển thị kết quả quét")
+        print("3. Thay thế URL từ kết quả")
+        print("4. Lưu kết quả ra file")
+        print("0. Quay lại")
+        choice = input("Chọn: ").strip()
+        if choice == '1':
+            term = input("Nhập từ khóa (mặc định 'http'): ").strip() or 'http'
+            res = patcher.oxorany_scan(term)
+            if res:
+                for i, (k, off, s) in enumerate(res, 1):
+                    print(f"{i}. key=0x{k:02X} offset=0x{off:X} -> {s}")
+            else:
+                print("❌ Không tìm thấy.")
+            input("\nEnter...")
+        elif choice == '2':
+            if not patcher.oxorany_results:
+                print("❌ Chưa có kết quả quét.")
+            else:
+                for i, (k, off, s) in enumerate(patcher.oxorany_results, 1):
+                    print(f"{i}. key=0x{k:02X} offset=0x{off:X} -> {s}")
+            input("\nEnter...")
+        elif choice == '3':
+            if not patcher.oxorany_results:
+                print("❌ Chưa quét, vui lòng quét trước.")
+                input(); continue
+            try:
+                idx = int(input("Chọn số thứ tự URL cần thay: ")) - 1
+                new = input("URL mới: ").strip()
+                if new:
+                    patcher.oxorany_replace(idx, new)
+            except:
+                print("❌ Lỗi.")
+            input("\nEnter...")
+        elif choice == '4':
+            patcher.oxorany_save_results()
+            input("\nEnter...")
+        elif choice == '0':
+            break
+
+def mode_combined(patcher):
+    clear_screen()
+    print("=" * 50)
+    print("     CHẾ ĐỘ 4: SCAN TỔNG HỢP (XOR + OXORANY)")
+    print("=" * 50)
+    term = input("Nhập từ khóa cho oxorany (mặc định 'http'): ").strip() or 'http'
+    patcher.combined_scan(term)
+    input("\nHoàn tất. Enter để quay lại menu chính.")
+
+# ─── Menu chính ────────────────────────────────────────────
+def main():
+    patcher = UniversalPatcher()
+    while True:
+        clear_screen()
+        print("=" * 60)
+        print("           UNIVERSAL .SO PATCHER")
+        print("=" * 60)
+        print(f"File: {patcher.file if patcher.file else 'Chưa chọn'}")
+        print("-" * 60)
+        print("1. Load file")
+        print("2. Chế độ: Không mã hóa (Plain Text)")
+        print("3. Chế độ: XOR Key")
+        print("4. Chế độ: Oxorany")
+        print("5. Chế độ: Scan tổng hợp")
+        print("6. Thoát")
+        print("-" * 60)
+        ch = input("Chọn: ").strip()
+        if ch == '1':
+            f = input("Đường dẫn file: ").strip()
+            if f: patcher.load_file(f)
+            input("\nEnter...")
+        elif ch == '2':
+            if not patcher.file:
+                print("❌ Chưa load file!"); input(); continue
+            mode_plain(patcher)
+        elif ch == '3':
+            if not patcher.file:
+                print("❌ Chưa load file!"); input(); continue
+            mode_xor(patcher)
+        elif ch == '4':
+            if not patcher.file:
+                print("❌ Chưa load file!"); input(); continue
+            mode_oxorany(patcher)
+        elif ch == '5':
+            if not patcher.file:
+                print("❌ Chưa load file!"); input(); continue
+            mode_combined(patcher)
+        elif ch == '6':
+            print("👋 Tạm biệt!")
+            break
         else:
-            cprint("❌ Lựa chọn không hợp lệ!", Colors.RED)
-            input("\nNhấn Enter...")
+            print("❌ Lựa chọn không hợp lệ!")
+            input()
 
 if __name__ == "__main__":
     try:
-        if sys.platform == "win32":
-            os.system("title MELZMOD URL TOOL - XOR + OXORANY")
-        clear_screen()
         main()
     except KeyboardInterrupt:
-        clear_screen()
-        cprint("\n🛑 Đã dừng bởi người dùng.", Colors.YELLOW)
-        sys.exit(0)
+        print("\n✋ Dừng bởi người dùng.")
